@@ -1,10 +1,11 @@
 # Python
-__pycache__/
-*.py[cod]
-*.class
+**/__pycache__/
+**/build/
+**/.venv/
 
-# Build
-build/
-.venv/
-env/
-venv/
+# Android
+**/.gradle/
+**/build/
+**/.idea/
+**/*.iml
+**/local.properties
