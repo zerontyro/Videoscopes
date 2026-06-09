@@ -1,8 +1,12 @@
 package com.example.videoscopes.ui.main
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.util.Size
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -12,6 +16,7 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -25,6 +30,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
@@ -41,6 +48,35 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.cos
 import kotlin.math.sin
+
+fun loadAndScaleBitmap(context: Context, uri: Uri): Bitmap? {
+    return try {
+        context.contentResolver.openInputStream(uri)?.use { inputStream ->
+            val options = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeStream(inputStream, null, options)
+            
+            val maxDim = 640
+            var scale = 1
+            if (options.outHeight > maxDim || options.outWidth > maxDim) {
+                scale = maxOf(options.outHeight / maxDim, options.outWidth / maxDim)
+            }
+            
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = scale
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, decodeOptions)
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
 
 @Composable
 fun MainScreen(
@@ -124,6 +160,19 @@ fun VideoScopesDashboard() {
     // Recomposition trigger
     var scopeUpdateTrigger by remember { mutableStateOf(0L) }
 
+    // Source photo state
+    var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let {
+            val scaled = loadAndScaleBitmap(context, it)
+            if (scaled != null) {
+                sourceBitmap = scaled
+            }
+        }
+    }
+
     // CameraX executor
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
@@ -133,14 +182,23 @@ fun VideoScopesDashboard() {
         }
     }
 
-    // Sync settings to processor
-    LaunchedEffect(vectorscopeMode, colormapIdx, harmonyMode, scopeIntensity, gain, satBoost) {
+    // Sync settings to processor and re-run if photo selected
+    LaunchedEffect(sourceBitmap, vectorscopeMode, colormapIdx, harmonyMode, scopeIntensity, gain, satBoost) {
         scopeProcessor.vectorscopeMode = vectorscopeMode
         scopeProcessor.colormapIdx = colormapIdx
         scopeProcessor.harmonyMode = harmonyMode
         scopeProcessor.scopeIntensity = scopeIntensity
         scopeProcessor.gain = gain
         scopeProcessor.satBoost = satBoost
+
+        if (sourceBitmap != null) {
+            val start = System.nanoTime()
+            scopeProcessor.processFrame(sourceBitmap!!)
+            val end = System.nanoTime()
+            latencyMs = (end - start) / 1_000_000.0
+            fps = 0.0
+            scopeUpdateTrigger = System.currentTimeMillis()
+        }
     }
 
     Scaffold(
@@ -162,48 +220,21 @@ fun VideoScopesDashboard() {
         },
         containerColor = Color(25, 15, 11)
     ) { paddingValues ->
+        val configuration = LocalConfiguration.current
+        val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            // 2x2 Scopes Grid
-            Column(modifier = Modifier.weight(1f)) {
-                // Top Row: Camera Preview + Vectorscope
+            if (isLandscape) {
+                // Landscape: 60% Left for prioritized Vectorscope, 40% Right for secondary items Column
                 Row(modifier = Modifier.weight(1f)) {
-                    // Pane 0,0: Camera Feed
+                    // Left Pane: Large prioritized Vectorscope
                     Box(
                         modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .border(1.dp, Color(59, 41, 30))
-                    ) {
-                        CameraPreviewView(
-                            executor = cameraExecutor,
-                            scopeProcessor = scopeProcessor,
-                            onProcessed = { currentFps, currentLatency ->
-                                fps = currentFps
-                                latencyMs = currentLatency
-                                scopeUpdateTrigger = System.currentTimeMillis()
-                            }
-                        )
-                        
-                        // Text overlays on preview
-                        Column(
-                            modifier = Modifier
-                                .padding(12.dp)
-                                .align(Alignment.TopStart)
-                        ) {
-                            Text("Source: Device Camera", color = Color(0, 255, 255), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                            Text(String.format("FPS: %.1f", fps), color = Color(0, 255, 255), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                            Text(String.format("Latency: %.1fms", latencyMs), color = Color(0, 255, 255), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                        }
-                    }
-
-                    // Pane 0,1: Vectorscope
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
+                            .weight(1.6f)
                             .fillMaxHeight()
                             .border(1.dp, Color(59, 41, 30)),
                         contentAlignment = Alignment.Center
@@ -220,22 +251,148 @@ fun VideoScopesDashboard() {
                                 .padding(12.dp)
                         )
                     }
-                }
 
-                // Bottom Row: Luminance Waveform + RGB Parade
-                Row(modifier = Modifier.weight(1f)) {
-                    // Pane 1,0: Waveform
+                    // Right Pane: Column of 3 smaller panels
+                    Column(
+                        modifier = Modifier
+                            .weight(1.0f)
+                            .fillMaxHeight()
+                    ) {
+                        // 1. Source (Camera Preview / Photo Display)
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .border(1.dp, Color(59, 41, 30)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                CameraPreviewView(
+                                    executor = cameraExecutor,
+                                    scopeProcessor = scopeProcessor,
+                                    isPhotoSelected = sourceBitmap != null,
+                                    onProcessed = { currentFps, currentLatency ->
+                                        if (sourceBitmap == null) {
+                                            fps = currentFps
+                                            latencyMs = currentLatency
+                                            scopeUpdateTrigger = System.currentTimeMillis()
+                                        }
+                                    }
+                                )
+                                if (sourceBitmap != null) {
+                                    Image(
+                                        bitmap = sourceBitmap!!.asImageBitmap(),
+                                        contentDescription = "Imported Photo",
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color(25, 15, 11)),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                }
+                            }
+                            
+                            // Text overlays on preview
+                            Column(
+                                modifier = Modifier
+                                    .padding(8.dp)
+                                    .align(Alignment.TopStart)
+                            ) {
+                                Text(
+                                    text = if (sourceBitmap == null) "Source: Device Camera" else "Source: Imported Photo",
+                                    color = Color(0, 255, 255),
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(String.format("FPS: %.1f", fps), color = Color(0, 255, 255), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                                Text(String.format("Latency: %.1fms", latencyMs), color = Color(0, 255, 255), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                            }
+                            
+                            // Import Toggle Button
+                            Button(
+                                onClick = {
+                                    if (sourceBitmap == null) {
+                                        photoPickerLauncher.launch("image/*")
+                                    } else {
+                                        sourceBitmap = null
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xCC3B291E),
+                                    contentColor = Color.White
+                                ),
+                                shape = RoundedCornerShape(4.dp),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(8.dp)
+                                    .height(24.dp)
+                            ) {
+                                Text(
+                                    text = if (sourceBitmap == null) "IMPORT PHOTO" else "USE CAMERA",
+                                    fontSize = 8.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        // 2. Luminance Waveform
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .border(1.dp, Color(59, 41, 30)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            WaveformView(scopeProcessor, scopeUpdateTrigger)
+                            
+                            Text(
+                                text = "LUMINANCE WAVEFORM",
+                                color = Color(240, 232, 226),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(8.dp)
+                            )
+                        }
+
+                        // 3. RGB Parade
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .border(1.dp, Color(59, 41, 30)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            ParadeView(scopeProcessor, scopeUpdateTrigger)
+                            
+                            Text(
+                                text = "RGB PARADE",
+                                color = Color(240, 232, 226),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(8.dp)
+                            )
+                        }
+                    }
+                }
+            } else {
+                // Portrait: 55% Top for prioritized Vectorscope, 45% Bottom for secondary items Row
+                Column(modifier = Modifier.weight(1f)) {
+                    // Top Pane: Large prioritized Vectorscope
                     Box(
                         modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
+                            .weight(1.5f)
+                            .fillMaxWidth()
                             .border(1.dp, Color(59, 41, 30)),
                         contentAlignment = Alignment.Center
                     ) {
-                        WaveformView(scopeProcessor, scopeUpdateTrigger)
+                        VectorscopeView(scopeProcessor, scopeUpdateTrigger)
                         
                         Text(
-                            text = "LUMINANCE WAVEFORM",
+                            text = if (vectorscopeMode == 0) "VECTORSCOPE: YCrCb" else "VECTORSCOPE: HSV",
                             color = Color(240, 232, 226),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
@@ -245,25 +402,130 @@ fun VideoScopesDashboard() {
                         )
                     }
 
-                    // Pane 1,1: RGB Parade
-                    Box(
+                    // Bottom Pane: Horizontal Row of 3 smaller panels
+                    Row(
                         modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .border(1.dp, Color(59, 41, 30)),
-                        contentAlignment = Alignment.Center
+                            .weight(1.0f)
+                            .fillMaxWidth()
                     ) {
-                        ParadeView(scopeProcessor, scopeUpdateTrigger)
-                        
-                        Text(
-                            text = "RGB PARADE",
-                            color = Color(240, 232, 226),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
+                        // 1. Source (Camera Preview / Photo Display)
+                        Box(
                             modifier = Modifier
-                                .align(Alignment.TopStart)
-                                .padding(12.dp)
-                        )
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .border(1.dp, Color(59, 41, 30)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                CameraPreviewView(
+                                    executor = cameraExecutor,
+                                    scopeProcessor = scopeProcessor,
+                                    isPhotoSelected = sourceBitmap != null,
+                                    onProcessed = { currentFps, currentLatency ->
+                                        if (sourceBitmap == null) {
+                                            fps = currentFps
+                                            latencyMs = currentLatency
+                                            scopeUpdateTrigger = System.currentTimeMillis()
+                                        }
+                                    }
+                                )
+                                if (sourceBitmap != null) {
+                                    Image(
+                                        bitmap = sourceBitmap!!.asImageBitmap(),
+                                        contentDescription = "Imported Photo",
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color(25, 15, 11)),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                }
+                            }
+                            
+                            // Text overlays on preview
+                            Column(
+                                modifier = Modifier
+                                    .padding(4.dp)
+                                    .align(Alignment.TopStart)
+                            ) {
+                                Text(
+                                    text = if (sourceBitmap == null) "Source" else "Photo",
+                                    color = Color(0, 255, 255),
+                                    fontSize = 8.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(String.format("%.1f FPS", fps), color = Color(0, 255, 255), fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                                Text(String.format("%.1fms", latencyMs), color = Color(0, 255, 255), fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                            }
+                            
+                            // Import Toggle Button
+                            Button(
+                                onClick = {
+                                    if (sourceBitmap == null) {
+                                        photoPickerLauncher.launch("image/*")
+                                    } else {
+                                        sourceBitmap = null
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xCC3B291E),
+                                    contentColor = Color.White
+                                ),
+                                shape = RoundedCornerShape(4.dp),
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(4.dp)
+                                    .height(20.dp)
+                            ) {
+                                Text(
+                                    text = if (sourceBitmap == null) "IMPORT" else "CAMERA",
+                                    fontSize = 7.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        // 2. Luminance Waveform
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .border(1.dp, Color(59, 41, 30)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            WaveformView(scopeProcessor, scopeUpdateTrigger)
+                            
+                            Text(
+                                text = "WAVEFORM",
+                                color = Color(240, 232, 226),
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(4.dp)
+                            )
+                        }
+
+                        // 3. RGB Parade
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .border(1.dp, Color(59, 41, 30)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            ParadeView(scopeProcessor, scopeUpdateTrigger)
+                            
+                            Text(
+                                text = "RGB PARADE",
+                                color = Color(240, 232, 226),
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(4.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -275,11 +537,14 @@ fun VideoScopesDashboard() {
 fun CameraPreviewView(
     executor: ExecutorService,
     scopeProcessor: ScopeProcessor,
+    isPhotoSelected: Boolean,
     onProcessed: (Double, Double) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val previewView = remember { PreviewView(context) }
+    
+    val currentIsPhotoSelected by rememberUpdatedState(isPhotoSelected)
     
     var lastFrameTime = remember { System.nanoTime() }
     var fpsAccumulator = remember { 30.0 }
@@ -301,6 +566,10 @@ fun CameraPreviewView(
                 .build()
 
             imageAnalysis.setAnalyzer(executor) { imageProxy ->
+                if (currentIsPhotoSelected) {
+                    imageProxy.close()
+                    return@setAnalyzer
+                }
                 val startTime = System.nanoTime()
                 
                 // Convert ImageProxy to Bitmap using CameraX native utility
@@ -352,6 +621,30 @@ fun CameraPreviewView(
 fun VectorscopeView(processor: ScopeProcessor, trigger: Long) {
     val gridColor = Color(80, 60, 45) // Dim warm grid
     val textColor = Color(240, 232, 226)
+
+    val hsvColors = remember {
+        listOf(
+            Color.Red,         // 0 deg
+            Color(0xFFE600FF), // Magenta (300 deg)
+            Color.Blue,        // 240 deg
+            Color.Cyan,        // 180 deg
+            Color.Green,       // 120 deg
+            Color.Yellow,      // 60 deg
+            Color.Red          // 360 deg
+        )
+    }
+    val ycrcbColors = remember {
+        listOf(
+            Color(0xFF0088FF), // 0 deg (Blue-Cyan)
+            Color.Cyan,        // ~81 deg
+            Color.Green,       // ~117 deg
+            Color.Yellow,      // ~171 deg
+            Color.Red,         // ~261 deg
+            Color(0xFFE600FF), // ~297 deg (Magenta)
+            Color.Blue,        // ~351 deg
+            Color(0xFF0088FF)  // 360 deg
+        )
+    }
 
     Canvas(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         // Force dependency recomposition on trigger tick
@@ -443,6 +736,30 @@ fun VectorscopeView(processor: ScopeProcessor, trigger: Long) {
             radius = radius,
             center = Offset(cx, cy),
             style = Stroke(1.dp.toPx())
+        )
+
+        // Draw Color Wheel Rim
+        val hsvBrush = Brush.sweepGradient(hsvColors, center = Offset(cx, cy))
+        val ycrcbBrush = Brush.sweepGradient(ycrcbColors, center = Offset(cx, cy))
+        val rimWidth = 4.dp.toPx()
+        drawCircle(
+            brush = if (processor.vectorscopeMode == 0) ycrcbBrush else hsvBrush,
+            radius = radius,
+            center = Offset(cx, cy),
+            style = Stroke(width = rimWidth)
+        )
+        // Frame the gradient rim with inner/outer thin black concentric borders
+        drawCircle(
+            color = Color.Black,
+            radius = radius + rimWidth / 2f,
+            center = Offset(cx, cy),
+            style = Stroke(width = 0.5.dp.toPx())
+        )
+        drawCircle(
+            color = Color.Black,
+            radius = radius - rimWidth / 2f,
+            center = Offset(cx, cy),
+            style = Stroke(width = 0.5.dp.toPx())
         )
         drawLine(
             color = gridColor,
